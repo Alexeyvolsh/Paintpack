@@ -1,0 +1,1844 @@
+diff --git CommonHeaders/USB_ID.h CommonHeaders/USB_ID.h
+index 7a234ca..384f93a 100644
+--- CommonHeaders/USB_ID.h
++++ CommonHeaders/USB_ID.h
+@@ -34,6 +34,10 @@
+ #define USB_VENDOR_ID   0x03EB
+ #define USB_PRODUCT_ID  0x204F
+ 
++/* Paintpack using Atmel VID:PID pair */
++#define USB_PP_VENDOR_ID 0x0E8F
++#define USB_PP_PRODUCT_ID 0x0025
++
+ #define USB_MANUFACTURER_STRING     "lightpack.googlecode.com"
+ #define USB_PRODUCT_STRING          "Lightpack"
+ 
+diff --git Software/src/LedDeviceManager.cpp Software/src/LedDeviceManager.cpp
+index 0dd9b3b..45356a2 100644
+--- Software/src/LedDeviceManager.cpp
++++ Software/src/LedDeviceManager.cpp
+@@ -28,6 +28,7 @@
+ 
+ #include "LedDeviceManager.hpp"
+ #include "LedDeviceLightpack.hpp"
++#include "LedDevicePaintpack.hpp"
+ #include "LedDeviceAlienFx.hpp"
+ #include "LedDeviceAdalight.hpp"
+ #include "LedDeviceArdulight.hpp"
+@@ -287,6 +288,10 @@ ILedDevice * LedDeviceManager::createLedDevice(SupportedDevices::DeviceType devi
+         DEBUG_LOW_LEVEL << Q_FUNC_INFO << "SupportedDevices::LightpackDevice";
+         return (ILedDevice *)new LedDeviceLightpack();
+ 
++    case SupportedDevices::DeviceTypePaintpack:
++        DEBUG_LOW_LEVEL << Q_FUNC_INFO << "SupportedDevices::PaintpackDevice";
++        return (ILedDevice *)new LedDevicePaintpack();
++
+     case SupportedDevices::DeviceTypeAlienFx:
+         DEBUG_LOW_LEVEL << Q_FUNC_INFO << "SupportedDevices::AlienFxDevice";
+ 
+diff --git Software/src/LedDevicePaintpack.cpp Software/src/LedDevicePaintpack.cpp
+new file mode 100644
+index 0000000..7070331
+--- /dev/null
++++ Software/src/LedDevicePaintpack.cpp
+@@ -0,0 +1,413 @@
++/*
++ * LightpackDevice.cpp
++ *
++ *  Created on: 26.07.2010
++ *      Author: Mike Shatohin (brunql)
++ *     Project: Lightpack
++ *
++ *  Lightpack is very simple implementation of the backlight for a laptop
++ *
++ *  Copyright (c) 2010, 2011 Mike Shatohin, mikeshatohin [at] gmail.com
++ *
++ *  Lightpack is free software: you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation, either version 2 of the License, or
++ *  (at your option) any later version.
++ *
++ *  Lightpack is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ *
++ */
++
++#include "LedDevicePaintpack.hpp"
++#include "LightpackApplication.hpp"
++
++#include <unistd.h>
++
++#include <QtDebug>
++#include "debug.h"
++#include "Settings.hpp"
++
++using namespace SettingsScope;
++
++const int LedDevicePaintpack::PingDeviceInterval = 1000;
++const int LedDevicePaintpack::MaximumLedsCount = MaximumNumberOfLeds::Paintpack;
++
++LedDevicePaintpack::LedDevicePaintpack(QObject *parent) : ILedDevice(parent)
++{
++    DEBUG_LOW_LEVEL << Q_FUNC_INFO;
++    DEBUG_LOW_LEVEL << Q_FUNC_INFO << "thread id: " << this->thread()->currentThreadId();
++
++    m_hidDevice = NULL;
++
++    memset(m_writeBuffer, 0, sizeof(m_writeBuffer));
++    memset(m_readBuffer, 0, sizeof(m_readBuffer));
++
++    m_timerPingDevice = new QTimer(this);
++
++    m_gamma = Settings::getDeviceGamma();
++    m_brightness = Settings::getDeviceBrightness();
++
++    connect(m_timerPingDevice, SIGNAL(timeout()), this, SLOT(timerPingDeviceTimeout()));
++    connect(this, SIGNAL(ioDeviceSuccess(bool)), this, SLOT(restartPingDevice(bool)));
++    connect(this, SIGNAL(openDeviceSuccess(bool)), this, SLOT(restartPingDevice(bool)));
++
++    DEBUG_LOW_LEVEL << Q_FUNC_INFO << "initialized";
++}
++
++LedDevicePaintpack::~LedDevicePaintpack()
++{
++    DEBUG_LOW_LEVEL << Q_FUNC_INFO << "hid_close(...);";
++    closeDevice();
++}
++
++void LedDevicePaintpack::setColors(const QList<QRgb> & colors)
++{
++    DEBUG_MID_LEVEL << Q_FUNC_INFO << hex << (colors.isEmpty() ? -1 : colors.first());
++
++    if (colors.count() > MaximumLedsCount) {
++        qWarning() << Q_FUNC_INFO << "data size is greater than max leds count";
++        return;
++    }
++
++    QMutexLocker locker(&getLightpackApp()->m_mutex);
++
++    resizeColorsBuffer(colors.count());
++
++    m_colorsSaved = colors;
++
++    LightpackMath::gammaCorrection(m_gamma, colors, m_colorsBuffer);
++    LightpackMath::brightnessCorrection(m_brightness, m_colorsBuffer);
++
++    int buffIndex = 3;
++
++    for (int i = 0; i < m_colorsBuffer.count(); i++)
++    {
++        StructRgb color = m_colorsBuffer[i];
++
++        m_writeBuffer[buffIndex++] = (unsigned char)color.r;
++        m_writeBuffer[buffIndex++] = (unsigned char)color.g;
++        m_writeBuffer[buffIndex++] = (unsigned char)color.b;
++    }
++
++    locker.unlock();
++
++    bool ok = writeBufferToDeviceWithCheck(3);
++
++    emit commandCompleted(ok);
++}
++
++void LedDevicePaintpack::switchOffLeds()
++{
++    DEBUG_LOW_LEVEL << Q_FUNC_INFO;
++
++    if (m_colorsSaved.count() == 0)
++    {
++        for (int i = 0; i < MaximumLedsCount; i++)
++            m_colorsSaved << 0;
++    } else {
++        for (int i = 0; i < m_colorsSaved.count(); i++)
++            m_colorsSaved[i] = 0;
++    }
++
++    setColors(m_colorsSaved);
++
++    // Stop ping device if switchOffLeds() signal comes
++    m_timerPingDevice->stop();
++
++}
++
++void LedDevicePaintpack::setRefreshDelay(int value)
++{
++    Q_UNUSED(value);
++    emit commandCompleted(true);
++}
++
++void LedDevicePaintpack::setColorDepth(int value)
++{
++    Q_UNUSED(value);
++    emit commandCompleted(true);
++}
++
++void LedDevicePaintpack::setSmoothSlowdown(int value)
++{
++    Q_UNUSED(value);
++    emit commandCompleted(true);
++}
++
++void LedDevicePaintpack::setColorSequence(QString /*value*/)
++{
++    emit commandCompleted(true);
++}
++
++void LedDevicePaintpack::setGamma(double value)
++{
++    DEBUG_LOW_LEVEL << Q_FUNC_INFO << value;
++
++    m_gamma = value;
++
++    if (Settings::isBacklightEnabled())
++        setColors(m_colorsSaved);
++    else
++        commandCompleted(true);
++}
++
++void LedDevicePaintpack::setBrightness(int percent)
++{
++
++    DEBUG_LOW_LEVEL << Q_FUNC_INFO << percent;
++
++    m_brightness = percent;
++
++    if (Settings::isBacklightEnabled())
++        setColors(m_colorsSaved);
++    else
++        commandCompleted(true);
++}
++
++void LedDevicePaintpack::requestFirmwareVersion()
++{
++
++    DEBUG_LOW_LEVEL << Q_FUNC_INFO;
++
++    QString fwVersion = "Paintpack DMX";
++
++    emit firmwareVersion(fwVersion);
++
++    emit commandCompleted(true);
++}
++
++// update firmware here
++void LedDevicePaintpack::updateDeviceSettings()
++{
++    m_writeBuffer[0] = 0x00;
++    m_writeBuffer[1] = 0x0F;
++    m_writeBuffer[2] = 0x00;
++    m_writeBuffer[3] = 0x01;
++    m_writeBuffer[4] = 0x02;
++    m_writeBuffer[5] = 0x03;
++    m_writeBuffer[6] = 0x04;
++    m_writeBuffer[7] = 0x05;
++    m_writeBuffer[8] = 0x06;
++
++    hid_write(m_hidDevice, m_writeBuffer, sizeof(m_writeBuffer));
++}
++
++void LedDevicePaintpack::open()
++{
++    DEBUG_MID_LEVEL << Q_FUNC_INFO;
++
++    if (m_hidDevice != NULL)
++    {
++        closeDevice();
++    }
++
++    DEBUG_LOW_LEVEL << Q_FUNC_INFO << QString("hid_open(0x%1, 0x%2)")
++                       .arg(USB_PP_VENDOR_ID, 4, 16, QChar('0'))
++                       .arg(USB_PP_PRODUCT_ID, 4, 16, QChar('0'));
++
++    m_hidDevice = hid_open(USB_PP_VENDOR_ID, USB_PP_PRODUCT_ID, NULL);
++
++    if (m_hidDevice == NULL)
++    {
++        DEBUG_LOW_LEVEL << Q_FUNC_INFO << "Paintpack device not found";
++        emit openDeviceSuccess(false);
++        return;
++    }
++
++    // Immediately return from hid_read() if no data available
++    hid_set_nonblocking(m_hidDevice, 1);
++
++    DEBUG_LOW_LEVEL << Q_FUNC_INFO << "Paintpack opened";
++
++    requestFirmwareVersion();
++
++    emit openDeviceSuccess(true);
++}
++
++bool LedDevicePaintpack::readDataFromDevice()
++{
++    DEBUG_LOW_LEVEL << Q_FUNC_INFO;
++
++    int bytes_read = hid_read(m_hidDevice, m_readBuffer, sizeof(m_readBuffer));
++
++    if(bytes_read < 0){
++        qWarning() << "Error reading data:" << bytes_read;
++        emit ioDeviceSuccess(false);
++        return false;
++    }
++    emit ioDeviceSuccess(true);
++    return true;
++}
++
++bool LedDevicePaintpack::writeBufferToDevice(int command)
++{    
++    DEBUG_MID_LEVEL << Q_FUNC_INFO << command;
++#if 0
++    DEBUG_LOW_LEVEL << Q_FUNC_INFO << "thread id: " << this->thread()->currentThreadId();
++#endif
++
++    m_writeBuffer[0] = 0x00;
++    m_writeBuffer[1] = command;
++    m_writeBuffer[2] = 0x00;
++
++    int error = hid_write(m_hidDevice, m_writeBuffer, sizeof(m_writeBuffer));
++    if (error < 0)
++    {
++        // Trying to repeat sending data:
++        error = hid_write(m_hidDevice, m_writeBuffer, sizeof(m_writeBuffer));
++        if(error < 0){
++            qWarning() << "Error writing data:" << error;
++            emit ioDeviceSuccess(false);
++            return false;
++        }
++    }
++    emit ioDeviceSuccess(true);
++    return true;
++}
++
++bool LedDevicePaintpack::tryToReopenDevice()
++{
++    open();
++
++    if (m_hidDevice == NULL)
++    {
++        return false;
++    }
++
++    DEBUG_LOW_LEVEL << Q_FUNC_INFO << "Reopen success";
++    return true;
++}
++
++bool LedDevicePaintpack::readDataFromDeviceWithCheck()
++{
++    DEBUG_MID_LEVEL << Q_FUNC_INFO;
++
++    if (m_hidDevice != NULL)
++    {
++        if (!readDataFromDevice())
++        {
++            if (tryToReopenDevice())
++                return readDataFromDevice();
++            else
++                return false;
++        }
++        return true;
++    } else {
++        if (tryToReopenDevice())
++            return readDataFromDevice();
++        else
++            return false;
++    }
++}
++
++bool LedDevicePaintpack::writeBufferToDeviceWithCheck(int command)
++{
++    DEBUG_MID_LEVEL << Q_FUNC_INFO;
++
++    if (m_hidDevice != NULL)
++    {
++        if (!writeBufferToDevice(command))
++        {
++            if (!writeBufferToDevice(command))
++            {
++                if (tryToReopenDevice())
++                    return writeBufferToDevice(command);
++                else
++                    return false;
++            }
++        }
++        return true;
++    } else {
++        if (tryToReopenDevice())
++            return writeBufferToDevice(command);
++        else
++            return false;
++    }
++}
++
++void LedDevicePaintpack::resizeColorsBuffer(int buffSize)
++{
++    if (m_colorsBuffer.count() == buffSize)
++        return;
++
++    m_colorsBuffer.clear();
++
++    if (buffSize > MaximumNumberOfLeds::Paintpack)
++    {
++        qCritical() << Q_FUNC_INFO << "buffSize > MaximumNumberOfLeds::Virtual" << buffSize << ">" << MaximumNumberOfLeds::Paintpack;
++
++        buffSize = MaximumNumberOfLeds::Paintpack;
++    }
++
++    for (int i = 0; i < MaximumNumberOfLeds::Paintpack; i++)
++    {
++        m_colorsBuffer << StructRgb();
++    }
++}
++
++void LedDevicePaintpack::closeDevice()
++{
++    DEBUG_MID_LEVEL << Q_FUNC_INFO;
++
++    hid_close(m_hidDevice);
++    m_hidDevice = NULL;
++}
++
++void LedDevicePaintpack::restartPingDevice(bool isSuccess)
++{
++    Q_UNUSED(isSuccess);
++
++    if (Settings::isBacklightEnabled() && Settings::isPingDeviceEverySecond())
++    {
++        m_timerPingDevice->start(PingDeviceInterval);
++    } else {
++        m_timerPingDevice->stop();
++    }
++}
++
++void LedDevicePaintpack::timerPingDeviceTimeout()
++{
++    DEBUG_MID_LEVEL << Q_FUNC_INFO;
++
++    if (m_hidDevice == NULL)
++    {
++        DEBUG_MID_LEVEL << Q_FUNC_INFO << "hid_open";
++        m_hidDevice = hid_open(USB_PP_VENDOR_ID, USB_PP_PRODUCT_ID, NULL);
++
++        if (m_hidDevice == NULL)
++        {
++            DEBUG_MID_LEVEL << Q_FUNC_INFO << "hid_open fail";
++            emit openDeviceSuccess(false);
++            return;
++        }
++        DEBUG_MID_LEVEL << Q_FUNC_INFO << "hid_open ok";
++
++        emit openDeviceSuccess(true);
++        closeDevice(); // device should be opened by open() function
++        return;
++    }
++
++    DEBUG_MID_LEVEL << Q_FUNC_INFO << "hid_write";
++
++    m_writeBuffer[0] = 0x00;
++    m_writeBuffer[1] = 0x00;
++    int bytes = hid_write(m_hidDevice, m_writeBuffer, sizeof(m_writeBuffer));
++
++    if (bytes < 0)
++    {
++        DEBUG_MID_LEVEL << Q_FUNC_INFO << "hid_write fail";
++        closeDevice();
++        emit ioDeviceSuccess(false);
++        return;
++    }
++
++    DEBUG_MID_LEVEL << Q_FUNC_INFO << "hid_write ok";
++
++    emit ioDeviceSuccess(true);
++}
+diff --git Software/src/LedDevicePaintpack.hpp Software/src/LedDevicePaintpack.hpp
+new file mode 100644
+index 0000000..3a89a75
+--- /dev/null
++++ Software/src/LedDevicePaintpack.hpp
+@@ -0,0 +1,97 @@
++/*
++ * LedDevicePaintpack.hpp
++ *
++ *  Created on: 04.01.2013
++ *      Author: Vladimir Smirnov (mindcollapse)
++ *     Project: Lightpack
++ *
++ *  Lightpack is very simple implementation of the backlight for a laptop
++ *
++ *  Copyright (c) 2010, 2011 Mike Shatohin, mikeshatohin [at] gmail.com
++ *
++ *  Lightpack is free software: you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation, either version 2 of the License, or
++ *  (at your option) any later version.
++ *
++ *  Lightpack is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ *
++ */
++
++
++#include <QtGui>
++
++#include "ILedDevice.hpp"
++#include "TimeEvaluations.hpp"
++#include "LightpackMath.hpp"
++
++#include "../../CommonHeaders/USB_ID.h"     /* For device VID, PID, vendor name and product name */
++#include "hidapi.h" /* USB HID API */
++
++#include "../../CommonHeaders/COMMANDS.h"   /* CMD defines */
++
++// This defines using in all data transfers to determine indexes in write_buffer[]
++// In device COMMAND have index 0, data 1 and so on, report id isn't using
++#define WRITE_BUFFER_INDEX_REPORT_ID    0
++#define WRITE_BUFFER_INDEX_COMMAND      1
++#define WRITE_BUFFER_INDEX_DATA_START   2
++
++#define WRITE_BUFFER_BOOTLOADER 15
++#define WRITE_BUFFER_COLORUPDATE 3
++
++class LedDevicePaintpack : public ILedDevice
++{
++    Q_OBJECT
++public:
++    LedDevicePaintpack(QObject *parent = 0);
++    ~LedDevicePaintpack();
++
++public slots:
++    void open();
++    void setColors(const QList<QRgb> & colors);
++    void switchOffLeds();
++    void setRefreshDelay(int value);
++    void setColorDepth(int value);
++    void setSmoothSlowdown(int value);
++    void setColorSequence(QString /*value*/);
++    void setGamma(double value);
++    void setBrightness(int percent);
++    void requestFirmwareVersion();
++    void updateDeviceSettings();
++
++private: 
++    bool readDataFromDevice();
++    bool writeBufferToDevice(int command);
++    bool tryToReopenDevice();
++    bool readDataFromDeviceWithCheck();
++    bool writeBufferToDeviceWithCheck(int command);    
++    void resizeColorsBuffer(int buffSize);
++    void closeDevice();
++
++private slots:
++    void restartPingDevice(bool isSuccess);
++    void timerPingDeviceTimeout();
++
++private:
++    hid_device *m_hidDevice;
++
++    unsigned char m_readBuffer[33];
++    unsigned char m_writeBuffer[33];
++
++    double m_gamma;
++    int m_brightness;    
++
++    QList<QRgb> m_colorsSaved;
++    QList<StructRgb> m_colorsBuffer;
++
++    QTimer *m_timerPingDevice;
++
++    static const int PingDeviceInterval;
++    static const int MaximumLedsCount;
++};
+diff --git Software/src/Settings.cpp Software/src/Settings.cpp
+index 47f079f..14f9f44 100644
+--- Software/src/Settings.cpp
++++ Software/src/Settings.cpp
+@@ -80,6 +80,13 @@ static const QString ColorSequence = "Adalight/ColorSequence";
+ static const QString Port = "Adalight/SerialPort";
+ static const QString BaudRate = "Adalight/BaudRate";
+ }
++namespace Paintpack
++{
++static const QString NumberOfLeds = "Paintpack/NumberOfLeds";
++static const QString ColorSequence = "Paintpack/ColorSequence";
++static const QString Port = "Paintpack/SerialPort";
++static const QString BaudRate = "Paintpack/BaudRate";
++}
+ namespace Ardulight
+ {
+ static const QString NumberOfLeds = "Ardulight/NumberOfLeds";
+@@ -108,6 +115,7 @@ static const QString MainConfigVersion = MAIN_CONFIG_FILE_VERSION;
+ namespace ConnectedDevice
+ {
+ static const QString LightpackDevice = "Lightpack";
++static const QString PaintpackDevice = "Paintpack";
+ static const QString AlienFxDevice = "AlienFx";
+ static const QString AdalightDevice = "Adalight";
+ static const QString ArdulightDevice = "Ardulight";
+@@ -253,6 +261,8 @@ void Settings::Initialize( const QString & applicationDirPath, bool isDebugLevel
+     setNewOptionMain(Main::Key::Lightpack::NumberOfLeds,    Main::Lightpack::NumberOfLedsDefault);
+     setNewOptionMain(Main::Key::Virtual::NumberOfLeds,      Main::Virtual::NumberOfLedsDefault);
+ 
++    setNewOptionMain(Main::Key::Paintpack::NumberOfLeds,    Main::Paintpack::NumberOfLedsDefault);
++
+     if (isDebugLevelObtainedFromCmdArgs == false)
+     {
+         bool ok = false;
+@@ -607,7 +617,7 @@ QString Settings::getConnectedDeviceName()
+ 
+ void Settings::setConnectedDeviceName(const QString & deviceName)
+ {
+-    DEBUG_LOW_LEVEL << Q_FUNC_INFO;
++    DEBUG_LOW_LEVEL << Q_FUNC_INFO << deviceName;
+     if (deviceName == "")
+         return; // silent return
+ 
+@@ -746,6 +756,10 @@ void Settings::setNumberOfLeds(SupportedDevices::DeviceType device, int numberOf
+             m_this->lightpackNumberOfLedsChanged(numberOfLeds);
+             break;
+ 
++            case DeviceTypePaintpack:
++            m_this->paintpackNumberOfLedsChanged(numberOfLeds);
++            break;
++
+             case DeviceTypeAdalight:
+             m_this->adalightNumberOfLedsChanged(numberOfLeds);
+             break;
+@@ -1450,11 +1464,13 @@ void Settings::initDevicesMap()
+     DEBUG_LOW_LEVEL << Q_FUNC_INFO;
+ 
+     m_devicesTypeToNameMap[SupportedDevices::DeviceTypeAdalight]  = Main::Value::ConnectedDevice::AdalightDevice;
++    m_devicesTypeToNameMap[SupportedDevices::DeviceTypePaintpack]   = Main::Value::ConnectedDevice::PaintpackDevice;
+     m_devicesTypeToNameMap[SupportedDevices::DeviceTypeArdulight] = Main::Value::ConnectedDevice::ArdulightDevice;
+     m_devicesTypeToNameMap[SupportedDevices::DeviceTypeLightpack] = Main::Value::ConnectedDevice::LightpackDevice;
+     m_devicesTypeToNameMap[SupportedDevices::DeviceTypeVirtual]   = Main::Value::ConnectedDevice::VirtualDevice;
+ 
+     m_devicesTypeToKeyNumberOfLedsMap[SupportedDevices::DeviceTypeAdalight]  = Main::Key::Adalight::NumberOfLeds;
++    m_devicesTypeToKeyNumberOfLedsMap[SupportedDevices::DeviceTypePaintpack]  = Main::Key::Paintpack::NumberOfLeds;
+     m_devicesTypeToKeyNumberOfLedsMap[SupportedDevices::DeviceTypeArdulight] = Main::Key::Ardulight::NumberOfLeds;
+     m_devicesTypeToKeyNumberOfLedsMap[SupportedDevices::DeviceTypeLightpack] = Main::Key::Lightpack::NumberOfLeds;
+     m_devicesTypeToKeyNumberOfLedsMap[SupportedDevices::DeviceTypeVirtual]   = Main::Key::Virtual::NumberOfLeds;
+diff --git Software/src/Settings.hpp Software/src/Settings.hpp
+index ebdb03c..ce9025d 100644
+--- Software/src/Settings.hpp
++++ Software/src/Settings.hpp
+@@ -219,6 +219,7 @@ signals:
+     void ardulightSerialPortNameChanged(const QString & port);
+     void ardulightSerialPortBaudRateChanged(const QString & baud);
+     void lightpackNumberOfLedsChanged(int numberOfLeds);
++    void paintpackNumberOfLedsChanged(int numberOfLeds);
+     void adalightNumberOfLedsChanged(int numberOfLeds);
+     void ardulightNumberOfLedsChanged(int numberOfLeds);
+     void virtualNumberOfLedsChanged(int numberOfLeds);
+diff --git Software/src/SettingsDefaults.hpp Software/src/SettingsDefaults.hpp
+index f30db2e..f0b8bfb 100644
+--- Software/src/SettingsDefaults.hpp
++++ Software/src/SettingsDefaults.hpp
+@@ -32,9 +32,9 @@
+ #include "enums.hpp"
+ 
+ #ifdef ALIEN_FX_SUPPORTED
+-#   define SUPPORTED_DEVICES            "Lightpack,AlienFx,Adalight,Ardulight,Virtual"
++#   define SUPPORTED_DEVICES            "Lightpack,Paintpack,AlienFx,Adalight,Ardulight,Virtual"
+ #else
+-#   define SUPPORTED_DEVICES            "Lightpack,Adalight,Ardulight,Virtual"
++#   define SUPPORTED_DEVICES            "Lightpack,Paintpack,Adalight,Ardulight,Virtual"
+ #endif
+ 
+ #ifdef WINAPI_GRAB_SUPPORT
+@@ -110,6 +110,10 @@ namespace Lightpack
+ {
+ static const int NumberOfLedsDefault = 10;
+ }
++namespace Paintpack
++{
++static const int NumberOfLedsDefault = 10;
++}
+ namespace Virtual
+ {
+ static const int NumberOfLedsDefault = 10;
+diff --git Software/src/SettingsWindow.cpp Software/src/SettingsWindow.cpp
+index 76284ac..88f3358 100644
+--- Software/src/SettingsWindow.cpp
++++ Software/src/SettingsWindow.cpp
+@@ -223,6 +223,7 @@ void SettingsWindow::connectSignalsSlots()
+     connect(ui->comboBox_AdalightColorSequence, SIGNAL(currentIndexChanged(QString)), this, SLOT(onColorSequence_valueChanged(QString)));
+     connect(ui->comboBox_ArdulightColorSequence, SIGNAL(currentIndexChanged(QString)), this, SLOT(onColorSequence_valueChanged(QString)));
+     connect(ui->spinBox_LightpackNumberOfLeds, SIGNAL(valueChanged(int)), this, SLOT(onLightpackNumberOfLeds_valueChanged(int)));
++    connect(ui->spinBox_PaintpackNumberOfLeds, SIGNAL(valueChanged(int)), this, SLOT(onPaintpackNumberOfLeds_valueChanged(int)));
+     connect(ui->spinBox_AdalightNumberOfLeds, SIGNAL(valueChanged(int)), this, SLOT(onAdalightNumberOfLeds_valueChanged(int)));
+     connect(ui->spinBox_ArdulightNumberOfLeds, SIGNAL(valueChanged(int)), this, SLOT(onArdulightNumberOfLeds_valueChanged(int)));
+     connect(ui->spinBox_VirtualNumberOfLeds, SIGNAL(valueChanged(int)), this, SLOT(onVirtualNumberOfLeds_valueChanged(int)));
+@@ -416,6 +417,11 @@ void SettingsWindow::updateDeviceTabWidgetsVisibility()
+         ui->tabDevices->setCurrentWidget(ui->tabDeviceAdalight);
+         break;
+ 
++    case SupportedDevices::DeviceTypePaintpack:
++        ui->groupBox_DeviceSpecificSettings->show();
++        ui->tabDevices->setCurrentWidget(ui->tabDevicePaintpack);
++        break;
++
+     case SupportedDevices::DeviceTypeArdulight:
+         ui->groupBox_DeviceSpecificSettings->show();
+         ui->tabDevices->setCurrentWidget(ui->tabDeviceArdulight);
+@@ -1149,6 +1155,13 @@ void SettingsWindow::onLightpackNumberOfLeds_valueChanged(int value)
+ 
+ }
+ 
++void SettingsWindow::onPaintpackNumberOfLeds_valueChanged(int value)
++{
++    DEBUG_LOW_LEVEL << Q_FUNC_INFO << "PP" << value;
++
++    Settings::setNumberOfLeds(SupportedDevices::DeviceTypePaintpack, value);
++}
++
+ void SettingsWindow::onAdalightNumberOfLeds_valueChanged(int value)
+ {
+     DEBUG_LOW_LEVEL << Q_FUNC_INFO << value;
+@@ -1817,6 +1830,7 @@ void SettingsWindow::updateUiFromSettings()
+     ui->horizontalSlider_MoodLampSpeed->setValue        (Settings::getMoodLampSpeed());
+ 
+     ui->spinBox_LightpackNumberOfLeds->setValue         (Settings::getNumberOfLeds(SupportedDevices::DeviceTypeLightpack));
++    ui->spinBox_PaintpackNumberOfLeds->setValue         (Settings::getNumberOfLeds(SupportedDevices::DeviceTypePaintpack));
+     ui->spinBox_AdalightNumberOfLeds->setValue          (Settings::getNumberOfLeds(SupportedDevices::DeviceTypeAdalight));
+     ui->spinBox_ArdulightNumberOfLeds->setValue         (Settings::getNumberOfLeds(SupportedDevices::DeviceTypeArdulight));
+     ui->spinBox_VirtualNumberOfLeds->setValue           (Settings::getNumberOfLeds(SupportedDevices::DeviceTypeVirtual));
+@@ -2359,3 +2373,8 @@ void SettingsWindow::on_pushButton_lumosityThresholdHelp_clicked()
+ {
+     showHelpOf(ui->horizontalSlider_LuminosityThreshold);
+ }
++
++void SettingsWindow::on_pushButton_PaintpackBootloader_clicked()
++{
++    emit intoBootloader();
++}
+diff --git Software/src/SettingsWindow.hpp Software/src/SettingsWindow.hpp
+index 0cb5a83..57bd8f2 100644
+--- Software/src/SettingsWindow.hpp
++++ Software/src/SettingsWindow.hpp
+ 
+ public slots:
+     void ledDeviceOpenSuccess(bool isSuccess);
+@@ -147,6 +148,7 @@ private slots:
+     void onDeviceColorDepth_valueChanged(int value);
+     void onDeviceConnectedDevice_currentIndexChanged(QString value);
+     void onLightpackNumberOfLeds_valueChanged(int value);
++    void onPaintpackNumberOfLeds_valueChanged(int value);
+     void onAdalightNumberOfLeds_valueChanged(int value);
+     void onArdulightNumberOfLeds_valueChanged(int value);
+     void onVirtualNumberOfLeds_valueChanged(int value);
+@@ -206,6 +208,8 @@ private slots:
+ 
+     void on_pushButton_lumosityThresholdHelp_clicked();
+ 
++    void on_pushButton_PaintpackBootloader_clicked();
++
+ private:
+     void updateTrayAndActionStates();    
+     void updateExpertModeWidgetsVisibility();
+diff --git Software/src/SettingsWindow.ui Software/src/SettingsWindow.ui
+index 23ed61c..3434f5d 100755
+--- Software/src/SettingsWindow.ui
++++ Software/src/SettingsWindow.ui
+@@ -7,8 +7,8 @@
+    <rect>
+     <x>0</x>
+     <y>0</y>
+-    <width>608</width>
+-    <height>599</height>
++    <width>619</width>
++    <height>600</height>
+    </rect>
+   </property>
+   <property name="sizePolicy">
+@@ -243,7 +243,7 @@
+        <enum>QTabWidget::Rounded</enum>
+       </property>
+       <property name="currentIndex">
+-       <number>3</number>
++       <number>1</number>
+       </property>
+       <widget class="QWidget" name="tabSoftwareOptions">
+        <property name="enabled">
+@@ -836,12 +836,56 @@
+         <property name="rightMargin">
+          <number>20</number>
+         </property>
++        <item row="3" column="0">
++         <widget class="QLabel" name="label_5">
++          <property name="sizePolicy">
++           <sizepolicy hsizetype="Preferred" vsizetype="Fixed">
++            <horstretch>0</horstretch>
++            <verstretch>0</verstretch>
++           </sizepolicy>
++          </property>
++          <property name="text">
++           <string>Overall brightness:</string>
++          </property>
++         </widget>
++        </item>
++        <item row="4" column="1">
++         <widget class="QSpinBox" name="spinBox_DeviceBrightness">
++          <property name="sizePolicy">
++           <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
++            <horstretch>0</horstretch>
++            <verstretch>0</verstretch>
++           </sizepolicy>
++          </property>
++          <property name="minimumSize">
++           <size>
++            <width>60</width>
++            <height>0</height>
++           </size>
++          </property>
++          <property name="maximumSize">
++           <size>
++            <width>50</width>
++            <height>16777215</height>
++           </size>
++          </property>
++          <property name="minimum">
++           <number>0</number>
++          </property>
++          <property name="maximum">
++           <number>100</number>
++          </property>
++          <property name="value">
++           <number>100</number>
++          </property>
++         </widget>
++        </item>
+         <item row="2" column="0">
+          <widget class="QComboBox" name="comboBox_ConnectedDevice">
+           <property name="minimumSize">
+            <size>
+             <width>143</width>
+-            <height>0</height>
++            <height>30</height>
+            </size>
+           </property>
+           <property name="maximumSize">
+@@ -850,6 +894,9 @@
+             <height>16777215</height>
+            </size>
+           </property>
++          <property name="frame">
++           <bool>true</bool>
++          </property>
+          </widget>
+         </item>
+         <item row="9" column="0">
+@@ -887,19 +934,6 @@
+           </property>
+          </widget>
+         </item>
+-        <item row="3" column="0">
+-         <widget class="QLabel" name="label_5">
+-          <property name="sizePolicy">
+-           <sizepolicy hsizetype="Preferred" vsizetype="Fixed">
+-            <horstretch>0</horstretch>
+-            <verstretch>0</verstretch>
+-           </sizepolicy>
+-          </property>
+-          <property name="text">
+-           <string>Overall brightness:</string>
+-          </property>
+-         </widget>
+-        </item>
+         <item row="4" column="0">
+          <widget class="QSlider" name="horizontalSlider_DeviceBrightness">
+           <property name="minimum">
+@@ -919,37 +953,6 @@
+           </property>
+          </widget>
+         </item>
+-        <item row="4" column="1">
+-         <widget class="QSpinBox" name="spinBox_DeviceBrightness">
+-          <property name="sizePolicy">
+-           <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
+-            <horstretch>0</horstretch>
+-            <verstretch>0</verstretch>
+-           </sizepolicy>
+-          </property>
+-          <property name="minimumSize">
+-           <size>
+-            <width>60</width>
+-            <height>0</height>
+-           </size>
+-          </property>
+-          <property name="maximumSize">
+-           <size>
+-            <width>50</width>
+-            <height>16777215</height>
+-           </size>
+-          </property>
+-          <property name="minimum">
+-           <number>0</number>
+-          </property>
+-          <property name="maximum">
+-           <number>100</number>
+-          </property>
+-          <property name="value">
+-           <number>100</number>
+-          </property>
+-         </widget>
+-        </item>
+         <item row="5" column="0">
+          <widget class="QLabel" name="label_GammaCorrection">
+           <property name="sizePolicy">
+@@ -997,37 +1000,6 @@
+           </property>
+          </widget>
+         </item>
+-        <item row="6" column="0">
+-         <widget class="QSlider" name="horizontalSlider_GammaCorrection">
+-          <property name="sizePolicy">
+-           <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+-            <horstretch>0</horstretch>
+-            <verstretch>0</verstretch>
+-           </sizepolicy>
+-          </property>
+-          <property name="whatsThis">
+-           <string>&lt;h4&gt;Gamma correction&lt;/h4&gt; It controls the level of saturation. The effect is clearly detectable in a video in screen grabbing mode&lt;br/&gt;Recommended value: 2.00</string>
+-          </property>
+-          <property name="minimum">
+-           <number>5</number>
+-          </property>
+-          <property name="maximum">
+-           <number>1000</number>
+-          </property>
+-          <property name="singleStep">
+-           <number>5</number>
+-          </property>
+-          <property name="orientation">
+-           <enum>Qt::Horizontal</enum>
+-          </property>
+-          <property name="tickPosition">
+-           <enum>QSlider::NoTicks</enum>
+-          </property>
+-          <property name="tickInterval">
+-           <number>100</number>
+-          </property>
+-         </widget>
+-        </item>
+         <item row="10" column="0" colspan="3">
+          <widget class="QGroupBox" name="groupBox_DeviceSpecificSettings">
+           <property name="sizePolicy">
+@@ -1070,7 +1042,7 @@
+               </size>
+              </property>
+              <property name="currentIndex">
+-              <number>0</number>
++              <number>1</number>
+              </property>
+              <property name="documentMode">
+               <bool>true</bool>
+@@ -1092,8 +1064,48 @@
+                <string>Lightpack</string>
+               </attribute>
+               <layout class="QGridLayout" name="gridLayout_13">
++               <item row="9" column="1">
++                <widget class="QSpinBox" name="spinBox_LightpackNumberOfLeds">
++                 <property name="enabled">
++                  <bool>true</bool>
++                 </property>
++                 <property name="sizePolicy">
++                  <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
++                   <horstretch>0</horstretch>
++                   <verstretch>0</verstretch>
++                  </sizepolicy>
++                 </property>
++                 <property name="minimumSize">
++                  <size>
++                   <width>50</width>
++                   <height>25</height>
++                  </size>
++                 </property>
++                 <property name="maximumSize">
++                  <size>
++                   <width>60</width>
++                   <height>16777215</height>
++                  </size>
++                 </property>
++                 <property name="minimum">
++                  <number>1</number>
++                 </property>
++                 <property name="maximum">
++                  <number>10</number>
++                 </property>
++                 <property name="value">
++                  <number>1</number>
++                 </property>
++                </widget>
++               </item>
+                <item row="7" column="0">
+                 <widget class="QSlider" name="horizontalSlider_DeviceRefreshDelay">
++                 <property name="minimumSize">
++                  <size>
++                   <width>0</width>
++                   <height>25</height>
++                  </size>
++                 </property>
+                  <property name="whatsThis">
+                   <string>&lt;h4&gt;Refresh delay&lt;/h4&gt; This setting’s values are inversely proportional to the PWM’s frequency. It's affects to performance.</string>
+                  </property>
+@@ -1114,42 +1126,42 @@
+                  </property>
+                 </widget>
+                </item>
+-               <item row="9" column="1">
+-                <widget class="QSpinBox" name="spinBox_LightpackNumberOfLeds">
+-                 <property name="enabled">
+-                  <bool>true</bool>
+-                 </property>
+-                 <property name="sizePolicy">
+-                  <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
+-                   <horstretch>0</horstretch>
+-                   <verstretch>0</verstretch>
+-                  </sizepolicy>
+-                 </property>
++               <item row="5" column="0">
++                <widget class="QSlider" name="horizontalSlider_DeviceSmooth">
+                  <property name="minimumSize">
+                   <size>
+-                   <width>50</width>
+-                   <height>0</height>
++                   <width>0</width>
++                   <height>25</height>
+                   </size>
+                  </property>
+-                 <property name="maximumSize">
+-                  <size>
+-                   <width>60</width>
+-                   <height>16777215</height>
+-                  </size>
++                 <property name="whatsThis">
++                  <string>&lt;h4&gt;Smoothness&lt;/h4&gt; It defines how many steps will be color changed in</string>
+                  </property>
+                  <property name="minimum">
+-                  <number>1</number>
++                  <number>0</number>
+                  </property>
+                  <property name="maximum">
+-                  <number>10</number>
++                  <number>255</number>
+                  </property>
+-                 <property name="value">
++                 <property name="pageStep">
+                   <number>1</number>
+                  </property>
++                 <property name="value">
++                  <number>100</number>
++                 </property>
++                 <property name="orientation">
++                  <enum>Qt::Horizontal</enum>
++                 </property>
+                 </widget>
+                </item>
+                <item row="3" column="0">
+                 <widget class="QSlider" name="horizontalSlider_DeviceColorDepth">
++                 <property name="minimumSize">
++                  <size>
++                   <width>0</width>
++                   <height>25</height>
++                  </size>
++                 </property>
+                  <property name="whatsThis">
+                   <string>&lt;h4&gt;Color depth&lt;/h4&gt; Number of colors per channel, one RGB LED uses 3 channels (value in power of 3).</string>
+                  </property>
+@@ -1178,6 +1190,12 @@
+                    <verstretch>0</verstretch>
+                   </sizepolicy>
+                  </property>
++                 <property name="minimumSize">
++                  <size>
++                   <width>0</width>
++                   <height>25</height>
++                  </size>
++                 </property>
+                  <property name="text">
+                   <string>Smoothness:</string>
+                  </property>
+@@ -1185,6 +1203,12 @@
+                </item>
+                <item row="9" column="0">
+                 <widget class="QSlider" name="horizontalSlider_LightpackNumberOfLeds">
++                 <property name="minimumSize">
++                  <size>
++                   <width>0</width>
++                   <height>25</height>
++                  </size>
++                 </property>
+                  <property name="minimum">
+                   <number>1</number>
+                  </property>
+@@ -1210,6 +1234,12 @@
+                    <verstretch>0</verstretch>
+                   </sizepolicy>
+                  </property>
++                 <property name="minimumSize">
++                  <size>
++                   <width>0</width>
++                   <height>25</height>
++                  </size>
++                 </property>
+                  <property name="text">
+                   <string>Refresh delay (Lightpack 5 and below):</string>
+                  </property>
+@@ -1236,61 +1266,14 @@
+                    <verstretch>0</verstretch>
+                   </sizepolicy>
+                  </property>
+-                 <property name="text">
+-                  <string>Number of LEDs:</string>
+-                 </property>
+-                </widget>
+-               </item>
+-               <item row="3" column="1">
+-                <widget class="QSpinBox" name="spinBox_DeviceColorDepth">
+-                 <property name="sizePolicy">
+-                  <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
+-                   <horstretch>0</horstretch>
+-                   <verstretch>0</verstretch>
+-                  </sizepolicy>
+-                 </property>
+                  <property name="minimumSize">
+                   <size>
+-                   <width>50</width>
+-                   <height>0</height>
+-                  </size>
+-                 </property>
+-                 <property name="maximumSize">
+-                  <size>
+-                   <width>60</width>
+-                   <height>16777215</height>
++                   <width>0</width>
++                   <height>25</height>
+                   </size>
+                  </property>
+-                 <property name="minimum">
+-                  <number>32</number>
+-                 </property>
+-                 <property name="maximum">
+-                  <number>255</number>
+-                 </property>
+-                 <property name="value">
+-                  <number>100</number>
+-                 </property>
+-                </widget>
+-               </item>
+-               <item row="5" column="0">
+-                <widget class="QSlider" name="horizontalSlider_DeviceSmooth">
+-                 <property name="whatsThis">
+-                  <string>&lt;h4&gt;Smoothness&lt;/h4&gt; It defines how many steps will be color changed in</string>
+-                 </property>
+-                 <property name="minimum">
+-                  <number>0</number>
+-                 </property>
+-                 <property name="maximum">
+-                  <number>255</number>
+-                 </property>
+-                 <property name="pageStep">
+-                  <number>1</number>
+-                 </property>
+-                 <property name="value">
+-                  <number>100</number>
+-                 </property>
+-                 <property name="orientation">
+-                  <enum>Qt::Horizontal</enum>
++                 <property name="text">
++                  <string>Number of LEDs:</string>
+                  </property>
+                 </widget>
+                </item>
+@@ -1302,6 +1285,12 @@
+                    <verstretch>0</verstretch>
+                   </sizepolicy>
+                  </property>
++                 <property name="minimumSize">
++                  <size>
++                   <width>0</width>
++                   <height>25</height>
++                  </size>
++                 </property>
+                  <property name="text">
+                   <string>Color depth (Lightpack 5 and below):</string>
+                  </property>
+@@ -1318,7 +1307,7 @@
+                  <property name="minimumSize">
+                   <size>
+                    <width>50</width>
+-                   <height>0</height>
++                   <height>25</height>
+                   </size>
+                  </property>
+                  <property name="maximumSize">
+@@ -1349,7 +1338,7 @@
+                  <property name="minimumSize">
+                   <size>
+                    <width>50</width>
+-                   <height>0</height>
++                   <height>25</height>
+                   </size>
+                  </property>
+                  <property name="maximumSize">
+@@ -1377,6 +1366,12 @@
+                    <verstretch>0</verstretch>
+                   </sizepolicy>
+                  </property>
++                 <property name="minimumSize">
++                  <size>
++                   <width>0</width>
++                   <height>20</height>
++                  </size>
++                 </property>
+                  <property name="styleSheet">
+                   <string notr="true">margin:0px;</string>
+                  </property>
+@@ -1400,6 +1395,12 @@
+                    <verstretch>0</verstretch>
+                   </sizepolicy>
+                  </property>
++                 <property name="minimumSize">
++                  <size>
++                   <width>0</width>
++                   <height>20</height>
++                  </size>
++                 </property>
+                  <property name="styleSheet">
+                   <string notr="true">margin:0px;</string>
+                  </property>
+@@ -1423,6 +1424,12 @@
+                    <verstretch>0</verstretch>
+                   </sizepolicy>
+                  </property>
++                 <property name="minimumSize">
++                  <size>
++                   <width>0</width>
++                   <height>20</height>
++                  </size>
++                 </property>
+                  <property name="styleSheet">
+                   <string notr="true">margin:0px;</string>
+                  </property>
+@@ -1438,8 +1445,143 @@
+                  </property>
+                 </widget>
+                </item>
++               <item row="3" column="1">
++                <widget class="QSpinBox" name="spinBox_DeviceColorDepth">
++                 <property name="sizePolicy">
++                  <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
++                   <horstretch>0</horstretch>
++                   <verstretch>0</verstretch>
++                  </sizepolicy>
++                 </property>
++                 <property name="minimumSize">
++                  <size>
++                   <width>50</width>
++                   <height>25</height>
++                  </size>
++                 </property>
++                 <property name="maximumSize">
++                  <size>
++                   <width>60</width>
++                   <height>16777215</height>
++                  </size>
++                 </property>
++                 <property name="minimum">
++                  <number>32</number>
++                 </property>
++                 <property name="maximum">
++                  <number>255</number>
++                 </property>
++                 <property name="value">
++                  <number>100</number>
++                 </property>
++                </widget>
++               </item>
+               </layout>
+              </widget>
++             <widget class="QWidget" name="tabDevicePaintpack">
++              <attribute name="title">
++               <string>Paintpack</string>
++              </attribute>
++              <widget class="QWidget" name="gridLayoutWidget">
++               <property name="geometry">
++                <rect>
++                 <x>0</x>
++                 <y>0</y>
++                 <width>401</width>
++                 <height>101</height>
++                </rect>
++               </property>
++               <layout class="QGridLayout" name="gridLayout_10">
++                <item row="0" column="0">
++                 <widget class="QLabel" name="label_NumberOfLeds_2">
++                  <property name="sizePolicy">
++                   <sizepolicy hsizetype="Preferred" vsizetype="Fixed">
++                    <horstretch>0</horstretch>
++                    <verstretch>0</verstretch>
++                   </sizepolicy>
++                  </property>
++                  <property name="minimumSize">
++                   <size>
++                    <width>0</width>
++                    <height>25</height>
++                   </size>
++                  </property>
++                  <property name="text">
++                   <string>Number of LEDs:</string>
++                  </property>
++                 </widget>
++                </item>
++                <item row="3" column="1">
++                 <widget class="QSpinBox" name="spinBox_PaintpackNumberOfLeds">
++                  <property name="enabled">
++                   <bool>true</bool>
++                  </property>
++                  <property name="sizePolicy">
++                   <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
++                    <horstretch>0</horstretch>
++                    <verstretch>0</verstretch>
++                   </sizepolicy>
++                  </property>
++                  <property name="minimumSize">
++                   <size>
++                    <width>50</width>
++                    <height>25</height>
++                   </size>
++                  </property>
++                  <property name="maximumSize">
++                   <size>
++                    <width>60</width>
++                    <height>16777215</height>
++                   </size>
++                  </property>
++                  <property name="minimum">
++                   <number>1</number>
++                  </property>
++                  <property name="maximum">
++                   <number>10</number>
++                  </property>
++                  <property name="value">
++                   <number>1</number>
++                  </property>
++                 </widget>
++                </item>
++                <item row="3" column="0">
++                 <widget class="QSlider" name="horizontalSlider_PaintpackNumberOfLeds">
++                  <property name="minimumSize">
++                   <size>
++                    <width>0</width>
++                    <height>25</height>
++                   </size>
++                  </property>
++                  <property name="minimum">
++                   <number>1</number>
++                  </property>
++                  <property name="maximum">
++                   <number>10</number>
++                  </property>
++                  <property name="orientation">
++                   <enum>Qt::Horizontal</enum>
++                  </property>
++                  <property name="tickPosition">
++                   <enum>QSlider::TicksAbove</enum>
++                  </property>
++                  <property name="tickInterval">
++                   <number>1</number>
++                  </property>
++                 </widget>
++                </item>
++                <item row="4" column="0">
++                 <widget class="QPushButton" name="pushButton_PaintpackBootloader">
++                  <property name="text">
++                   <string>Put Paintpack to the bootloader mode</string>
++                  </property>
++                 </widget>
++                </item>
++               </layout>
++              </widget>
++              <zorder>gridLayoutWidget</zorder>
++              <zorder>spinBox_PaintpackNumberOfLeds</zorder>
++             </widget>
+              <widget class="QWidget" name="tabDeviceAdalight">
+               <attribute name="title">
+                <string notr="true">Adalight</string>
+@@ -1925,19 +2067,6 @@
+           </layout>
+          </widget>
+         </item>
+-        <item row="11" column="0">
+-         <spacer name="verticalSpacer_2">
+-          <property name="orientation">
+-           <enum>Qt::Vertical</enum>
+-          </property>
+-          <property name="sizeHint" stdset="0">
+-           <size>
+-            <width>20</width>
+-            <height>40</height>
+-           </size>
+-          </property>
+-         </spacer>
+-        </item>
+         <item row="6" column="2">
+          <widget class="QPushButton" name="pushButton_GammaCorrectionHelp">
+           <property name="sizePolicy">
+@@ -1974,6 +2103,50 @@
+           </property>
+          </widget>
+         </item>
++        <item row="6" column="0">
++         <widget class="QSlider" name="horizontalSlider_GammaCorrection">
++          <property name="sizePolicy">
++           <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
++            <horstretch>0</horstretch>
++            <verstretch>0</verstretch>
++           </sizepolicy>
++          </property>
++          <property name="whatsThis">
++           <string>&lt;h4&gt;Gamma correction&lt;/h4&gt; It controls the level of saturation. The effect is clearly detectable in a video in screen grabbing mode&lt;br/&gt;Recommended value: 2.00</string>
++          </property>
++          <property name="minimum">
++           <number>5</number>
++          </property>
++          <property name="maximum">
++           <number>1000</number>
++          </property>
++          <property name="singleStep">
++           <number>5</number>
++          </property>
++          <property name="orientation">
++           <enum>Qt::Horizontal</enum>
++          </property>
++          <property name="tickPosition">
++           <enum>QSlider::NoTicks</enum>
++          </property>
++          <property name="tickInterval">
++           <number>100</number>
++          </property>
++         </widget>
++        </item>
++        <item row="11" column="0" colspan="2">
++         <spacer name="verticalSpacer_2">
++          <property name="orientation">
++           <enum>Qt::Vertical</enum>
++          </property>
++          <property name="sizeHint" stdset="0">
++           <size>
++            <width>20</width>
++            <height>40</height>
++           </size>
++          </property>
++         </spacer>
++        </item>
+        </layout>
+       </widget>
+       <widget class="QWidget" name="tabProfiles">
+@@ -3369,12 +3542,12 @@ p, li { white-space: pre-wrap; }
+    <slot>setValue(int)</slot>
+    <hints>
+     <hint type="sourcelabel">
+-     <x>184</x>
+-     <y>84</y>
++     <x>339</x>
++     <y>451</y>
+     </hint>
+     <hint type="destinationlabel">
+-     <x>240</x>
+-     <y>84</y>
++     <x>534</x>
++     <y>454</y>
+     </hint>
+    </hints>
+   </connection>
+@@ -3385,12 +3558,12 @@ p, li { white-space: pre-wrap; }
+    <slot>setValue(int)</slot>
+    <hints>
+     <hint type="sourcelabel">
+-     <x>240</x>
+-     <y>84</y>
++     <x>534</x>
++     <y>454</y>
+     </hint>
+     <hint type="destinationlabel">
+-     <x>184</x>
+-     <y>84</y>
++     <x>339</x>
++     <y>451</y>
+     </hint>
+    </hints>
+   </connection>
+@@ -3401,12 +3574,12 @@ p, li { white-space: pre-wrap; }
+    <slot>setValue(int)</slot>
+    <hints>
+     <hint type="sourcelabel">
+-     <x>184</x>
+-     <y>75</y>
++     <x>339</x>
++     <y>403</y>
+     </hint>
+     <hint type="destinationlabel">
+-     <x>240</x>
+-     <y>75</y>
++     <x>534</x>
++     <y>406</y>
+     </hint>
+    </hints>
+   </connection>
+@@ -3417,12 +3590,12 @@ p, li { white-space: pre-wrap; }
+    <slot>setValue(int)</slot>
+    <hints>
+     <hint type="sourcelabel">
+-     <x>240</x>
+-     <y>75</y>
++     <x>534</x>
++     <y>406</y>
+     </hint>
+     <hint type="destinationlabel">
+-     <x>184</x>
+-     <y>75</y>
++     <x>339</x>
++     <y>403</y>
+     </hint>
+    </hints>
+   </connection>
+@@ -3433,12 +3606,12 @@ p, li { white-space: pre-wrap; }
+    <slot>setValue(int)</slot>
+    <hints>
+     <hint type="sourcelabel">
+-     <x>233</x>
+-     <y>46</y>
++     <x>551</x>
++     <y>156</y>
+     </hint>
+     <hint type="destinationlabel">
+-     <x>167</x>
+-     <y>46</y>
++     <x>307</x>
++     <y>154</y>
+     </hint>
+    </hints>
+   </connection>
+@@ -3449,12 +3622,12 @@ p, li { white-space: pre-wrap; }
+    <slot>setValue(int)</slot>
+    <hints>
+     <hint type="sourcelabel">
+-     <x>167</x>
+-     <y>46</y>
++     <x>307</x>
++     <y>154</y>
+     </hint>
+     <hint type="destinationlabel">
+-     <x>233</x>
+-     <y>46</y>
++     <x>551</x>
++     <y>156</y>
+     </hint>
+    </hints>
+   </connection>
+@@ -3465,12 +3638,12 @@ p, li { white-space: pre-wrap; }
+    <slot>setValue(int)</slot>
+    <hints>
+     <hint type="sourcelabel">
+-     <x>184</x>
+-     <y>65</y>
++     <x>339</x>
++     <y>356</y>
+     </hint>
+     <hint type="destinationlabel">
+-     <x>240</x>
+-     <y>65</y>
++     <x>534</x>
++     <y>359</y>
+     </hint>
+    </hints>
+   </connection>
+@@ -3481,12 +3654,12 @@ p, li { white-space: pre-wrap; }
+    <slot>setValue(int)</slot>
+    <hints>
+     <hint type="sourcelabel">
+-     <x>240</x>
+-     <y>65</y>
++     <x>534</x>
++     <y>359</y>
+     </hint>
+     <hint type="destinationlabel">
+-     <x>184</x>
+-     <y>65</y>
++     <x>339</x>
++     <y>356</y>
+     </hint>
+    </hints>
+   </connection>
+@@ -3497,12 +3670,12 @@ p, li { white-space: pre-wrap; }
+    <slot>setValue(int)</slot>
+    <hints>
+     <hint type="sourcelabel">
+-     <x>184</x>
+-     <y>93</y>
++     <x>339</x>
++     <y>501</y>
+     </hint>
+     <hint type="destinationlabel">
+-     <x>240</x>
+-     <y>93</y>
++     <x>534</x>
++     <y>501</y>
+     </hint>
+    </hints>
+   </connection>
+@@ -3513,12 +3686,12 @@ p, li { white-space: pre-wrap; }
+    <slot>setValue(int)</slot>
+    <hints>
+     <hint type="sourcelabel">
+-     <x>240</x>
+-     <y>93</y>
++     <x>534</x>
++     <y>501</y>
+     </hint>
+     <hint type="destinationlabel">
+-     <x>184</x>
+-     <y>93</y>
++     <x>339</x>
++     <y>501</y>
+     </hint>
+    </hints>
+   </connection>
+@@ -3529,12 +3702,12 @@ p, li { white-space: pre-wrap; }
+    <slot>setValue(int)</slot>
+    <hints>
+     <hint type="sourcelabel">
+-     <x>195</x>
+-     <y>79</y>
++     <x>350</x>
++     <y>491</y>
+     </hint>
+     <hint type="destinationlabel">
+-     <x>257</x>
+-     <y>79</y>
++     <x>566</x>
++     <y>488</y>
+     </hint>
+    </hints>
+   </connection>
+@@ -3545,12 +3718,12 @@ p, li { white-space: pre-wrap; }
+    <slot>setValue(int)</slot>
+    <hints>
+     <hint type="sourcelabel">
+-     <x>257</x>
+-     <y>79</y>
++     <x>566</x>
++     <y>488</y>
+     </hint>
+     <hint type="destinationlabel">
+-     <x>195</x>
+-     <y>79</y>
++     <x>350</x>
++     <y>491</y>
+     </hint>
+    </hints>
+   </connection>
+@@ -3561,12 +3734,12 @@ p, li { white-space: pre-wrap; }
+    <slot>setValue(int)</slot>
+    <hints>
+     <hint type="sourcelabel">
+-     <x>195</x>
+-     <y>79</y>
++     <x>350</x>
++     <y>492</y>
+     </hint>
+     <hint type="destinationlabel">
+-     <x>257</x>
+-     <y>79</y>
++     <x>566</x>
++     <y>489</y>
+     </hint>
+    </hints>
+   </connection>
+@@ -3577,12 +3750,12 @@ p, li { white-space: pre-wrap; }
+    <slot>setValue(int)</slot>
+    <hints>
+     <hint type="sourcelabel">
+-     <x>257</x>
+-     <y>79</y>
++     <x>566</x>
++     <y>489</y>
+     </hint>
+     <hint type="destinationlabel">
+-     <x>195</x>
+-     <y>79</y>
++     <x>350</x>
++     <y>492</y>
+     </hint>
+    </hints>
+   </connection>
+@@ -3593,12 +3766,12 @@ p, li { white-space: pre-wrap; }
+    <slot>setValue(int)</slot>
+    <hints>
+     <hint type="sourcelabel">
+-     <x>195</x>
+-     <y>68</y>
++     <x>218</x>
++     <y>313</y>
+     </hint>
+     <hint type="destinationlabel">
+-     <x>257</x>
+-     <y>68</y>
++     <x>280</x>
++     <y>313</y>
+     </hint>
+    </hints>
+   </connection>
+@@ -3609,12 +3782,12 @@ p, li { white-space: pre-wrap; }
+    <slot>setValue(int)</slot>
+    <hints>
+     <hint type="sourcelabel">
+-     <x>257</x>
+-     <y>68</y>
++     <x>280</x>
++     <y>313</y>
+     </hint>
+     <hint type="destinationlabel">
+-     <x>195</x>
+-     <y>68</y>
++     <x>218</x>
++     <y>313</y>
+     </hint>
+    </hints>
+   </connection>
+@@ -3625,12 +3798,12 @@ p, li { white-space: pre-wrap; }
+    <slot>setValue(int)</slot>
+    <hints>
+     <hint type="sourcelabel">
+-     <x>393</x>
+-     <y>289</y>
++     <x>461</x>
++     <y>277</y>
+     </hint>
+     <hint type="destinationlabel">
+-     <x>492</x>
+-     <y>292</y>
++     <x>524</x>
++     <y>279</y>
+     </hint>
+    </hints>
+   </connection>
+@@ -3641,12 +3814,44 @@ p, li { white-space: pre-wrap; }
+    <slot>setValue(int)</slot>
+    <hints>
+     <hint type="sourcelabel">
+-     <x>480</x>
+-     <y>299</y>
++     <x>524</x>
++     <y>279</y>
++    </hint>
++    <hint type="destinationlabel">
++     <x>453</x>
++     <y>277</y>
++    </hint>
++   </hints>
++  </connection>
++  <connection>
++   <sender>horizontalSlider_PaintpackNumberOfLeds</sender>
++   <signal>valueChanged(int)</signal>
++   <receiver>spinBox_PaintpackNumberOfLeds</receiver>
++   <slot>setValue(int)</slot>
++   <hints>
++    <hint type="sourcelabel">
++     <x>384</x>
++     <y>346</y>
++    </hint>
++    <hint type="destinationlabel">
++     <x>535</x>
++     <y>353</y>
++    </hint>
++   </hints>
++  </connection>
++  <connection>
++   <sender>spinBox_PaintpackNumberOfLeds</sender>
++   <signal>valueChanged(int)</signal>
++   <receiver>horizontalSlider_PaintpackNumberOfLeds</receiver>
++   <slot>setValue(int)</slot>
++   <hints>
++    <hint type="sourcelabel">
++     <x>544</x>
++     <y>339</y>
+     </hint>
+     <hint type="destinationlabel">
+-     <x>301</x>
+-     <y>297</y>
++     <x>465</x>
++     <y>337</y>
+     </hint>
+    </hints>
+   </connection>
+diff --git Software/src/enums.hpp Software/src/enums.hpp
+index 6a5779f..a0c10c6 100644
+--- Software/src/enums.hpp
++++ Software/src/enums.hpp
+@@ -83,6 +83,7 @@ namespace SupportedDevices
+ {
+ enum DeviceType {
+     DeviceTypeLightpack,
++    DeviceTypePaintpack,
+     DeviceTypeAlienFx,
+     DeviceTypeAdalight,
+     DeviceTypeVirtual,
+@@ -104,6 +105,8 @@ enum Devices
+     AlienFx     = 1,
+     Virtual     = 255,
+ 
++    Paintpack   = 10,
++
+     Lightpack4  = 8,
+     Lightpack5  = 10,
+     Lightpack6  = 10,
+diff --git Software/src/src.pro Software/src/src.pro
+index 3e92d6c..8c79d4f 100644
+--- Software/src/src.pro
++++ Software/src/src.pro
+@@ -41,6 +41,8 @@ RC_FILE      = ../res/Lightpack.rc
+ 
+ include(../build-config.prf)
+ 
++CONFIG += static
++
+ unix{
+     CONFIG    += link_pkgconfig
+     PKGCONFIG += libusb-1.0
+@@ -96,7 +98,7 @@ macx{
+     ICON = ../res/icons/Lightpack.icns
+ 
+     # For build universal binaries (native on Intel and PowerPC)
+-    QMAKE_MAC_SDK = /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX10.6.sdk
++    QMAKE_MAC_SDK = /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX10.7.sdk
+ }
+ 
+ INCLUDEPATH += ./hidapi ./grab ./alienfx ./
+@@ -106,6 +108,7 @@ SOURCES += \
+       GrabWidget.cpp  GrabConfigWidget.cpp \
+     SpeedTest.cpp \
+     LedDeviceLightpack.cpp \
++    LedDevicePaintpack.cpp \
+     LedDeviceAlienFx.cpp \
+     LedDeviceAdalight.cpp \
+     LedDeviceArdulight.cpp \
+@@ -153,6 +156,7 @@ HEADERS += \
+     LedDeviceAdalight.hpp \
+     LedDeviceArdulight.hpp \
+     LedDeviceVirtual.hpp \
++    LedDevicePaintpack.hpp \
+     ColorButton.hpp \
+     grab/WinAPIGrabber.hpp \
+     ../common/defs.h \
